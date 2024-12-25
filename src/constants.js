@@ -1,1 +1,1 @@
-export const DB_NAME = "clipcast"
+export const DB_NAME = "video_upload"

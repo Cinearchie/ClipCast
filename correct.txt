@@ -1,0 +1,240 @@
+// user.controllers
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { ApiError } from "../utils/ApiError.js";
+import { User } from "../models/user.models.js";
+import { uploadOnCloudinary } from "../utils/cloudinary.js";
+import { ApiResponse } from "../utils/ApiResponse.js";
+import { deleteCloudinary } from "../utils/cloudinary.js";
+const registerUser = asyncHandler(async (req, res) => {
+  const { fullname, email, username, password } = req.body;
+  // Validation
+  if ([fullname, username, email, password].some((field) => field?.trim() === "")) {
+    throw new ApiError(400, "All fields are required!");
+  }
+  const existedUser = await User.findOne({
+    $or: [{ username }, { email }],
+  });
+  if (existedUser) {
+    throw new ApiError(405, "Username or email already exists!");
+  }
+  console.log("req.files:", req.files);
+  const avatarLocalPath = req.files?.avatar?.[0]?.path;
+  const coverLocalPath = req.files?.coverImage?.[0]?.path;
+  if (!avatarLocalPath) {
+    throw new ApiError(405, "Avatar is a compulsory field");
+  }
+  let avatar;
+  let coverImage;
+  try {
+    avatar = await uploadOnCloudinary(avatarLocalPath);
+    console.log("Uploaded avatar successfully!", avatar);
+  } catch (error) {
+    console.error("Error uploading avatar:", error);
+    throw new ApiError(500, "Avatar uploading failed");
+  }
+  if (coverLocalPath) {
+    try {
+      coverImage = await uploadOnCloudinary(coverLocalPath);
+      console.log("Uploaded cover image successfully!", coverImage);
+    } catch (error) {
+      console.error("Error uploading coverImage:", error);
+      throw new ApiError(500, "Cover Image uploading failed");
+    }
+  } else {
+    console.warn("No cover image provided");
+  }
+  try {
+    const user = await User.create({
+      fullname,
+      avatar: avatar.url,
+      coverImage: coverImage?.url || "",
+      email,
+      password,
+      username: username.toLowerCase(),
+    });
+    const createdUser = await User.findById(user._id).select("-password -refreshToken");
+    if (!createdUser) {
+      throw new ApiError(500, "Something went wrong while saving user details!");
+    }
+    return res.status(201).json(new ApiResponse(200, createdUser, "User registered successfully"));
+  } catch (error) {
+    console.error("User creation failed:", error);
+    // Clean up uploaded files on failure
+    if (avatar) {
+      await deleteCloudinary(avatar.public_id);
+    }
+    if (coverImage) {
+      await deleteCloudinary(coverImage.public_id);
+    }
+    throw new ApiError(500, "Something went wrong while registering user");
+  }
+});
+export { registerUser };
+
+
+
+
+
+
+
+
+//user.models
+import mongoose, { Schema } from "mongoose";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+// Constants for token expiry
+const ACCESS_TOKEN_EXPIRY = process.env.ACCESS_TOKEN_EXPIRY || "15m";
+const REFRESH_TOKEN_EXPIRY = process.env.REFRESH_TOKEN_EXPIRY || "7d";
+const userSchema = new Schema(
+  {
+    username: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+      index: true,
+    },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
+    fullname: {
+      type: String,
+      required: true,
+      trim: true,
+      index: true,
+    },
+    avatar: {
+      type: String,
+      required: true,
+    },
+    coverImage: {
+      type: String,
+    },
+    watchHistory: [
+      {
+        type: Schema.Types.ObjectId,
+        ref: "Video",
+      },
+    ],
+    password: {
+      type: String,
+      required: [true, "Password is a required field"],
+    },
+    refreshToken: {
+      type: String,
+    },
+  },
+  { timestamps: true }
+);
+// Middleware to hash password before saving
+userSchema.pre("save", async function (next) {
+  if (!this.isModified("password")) return next();
+  try {
+    this.password = await bcrypt.hash(this.password, 12);
+    next();
+  } catch (error) {
+    next(error); // Pass error to Mongoose
+  }
+});
+// Check if password is correct
+userSchema.methods.isPasswordCorrect = async function (password) {
+  return bcrypt.compare(password, this.password);
+};
+// Generate access token
+userSchema.methods.generateAccessToken = function () {
+  return jwt.sign(
+    {
+      _id: this._id,
+      email: this.email,
+    },
+    process.env.ACCESS_TOKEN_SECRET,
+    { expiresIn: ACCESS_TOKEN_EXPIRY }
+  );
+};
+// Generate refresh token
+userSchema.methods.generateRefreshToken = function () {
+  return jwt.sign(
+    {
+      _id: this._id,
+    },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: REFRESH_TOKEN_EXPIRY }
+  );
+};
+export const User = mongoose.model("User", userSchema);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// cloudinary.js
+import { v2 as cloudinary } from 'cloudinary';
+import fs from 'fs/promises'; // Use `fs/promises` for better async handling
+import dotenv from "dotenv";
+dotenv.config();
+// Configuration
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+/**
+ * Upload a file to Cloudinary.
+ * @param {string} localFilePath - Path to the local file to upload.
+ * @returns {Object|null} - Returns an object with Cloudinary details or null on failure.
+ */
+export const uploadOnCloudinary = async (localFilePath) => {
+  try {
+    if (!localFilePath) {
+      console.error("Invalid file path provided for upload.");
+      return null;
+    }
+    // Upload file to Cloudinary
+    const result = await cloudinary.uploader.upload(localFilePath, {
+      resource_type: "auto",
+    });
+    console.log("File uploaded to Cloudinary:", result.secure_url);
+    // Remove local file after successful upload
+    await fs.unlink(localFilePath);
+    return result;
+  } catch (error) {
+    console.error("Error uploading to Cloudinary:", error);
+    // Attempt to remove the local file even on failure
+    try {
+      await fs.unlink(localFilePath);
+    } catch (unlinkError) {
+      console.error("Error deleting local file:", unlinkError);
+    }
+    return null;
+  }
+};
+/**
+ * Delete a file from Cloudinary.
+ * @param {string} publicId - The public ID of the file to delete.
+ * @returns {boolean} - Returns true if the deletion was successful, false otherwise.
+ */
+export const deleteCloudinary = async (publicId) => {
+  try {
+    const result = await cloudinary.uploader.destroy(publicId);
+    console.log("Deleted from Cloudinary:", result);
+    return result.result === "ok";
+  } catch (error) {
+    console.error("Error deleting from Cloudinary:", error);
+    return false;
+  }
+};
